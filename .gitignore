@@ -1,0 +1,6 @@
+
+*.exe
+*.pdb
+/x64
+/Evanesco/x64
+/.vs
